@@ -22,12 +22,44 @@ import moment = require("moment");
 import _ = require("lodash");
 var shortId = require("shortid");
 
+interface BitmexWebsocketOp {
+    op: string,
+    args: string|string[]
+}
+
+interface BitmexPublication<T> {
+    table: string,
+    keys: string[],
+    action: string,
+    data: T
+}
+
+interface BitmexOrderBookFull {
+    symbol: string,
+    bids: [number, number][],
+    asks: [number, number][],
+    timestamp: string
+}
+
+interface BitmexMarketTrade {
+    timestamp: string,
+    symbol: string,
+    side: string,
+    size: number,
+    price: number,
+    tickDirection: string,
+    trdMatchID: string,
+    grossValue: number,
+    homeNotional: number,
+    foreignNotional: number
+}
+
 class BitmexWebsocket {
     private _log = Utils.log("BitmexWebsocket");
     private _ws: ws = null;
     
     private _connectChangedHandlers : Utils.Evt<Models.ConnectivityStatus>[] = [];
-    private _handlers : {[topic: string] : (msg: any) => void} = {};
+    private _handlers : {[topic: string] : (msg: Models.Timestamped<BitmexPublication<any>>) => void} = {};
     
     constructor(private _config : Config.IConfigProvider) {
         this.regenerateWebsocket();
@@ -35,7 +67,7 @@ class BitmexWebsocket {
     
     private regenerateWebsocket = () => {
         if (this._ws !== null) {
-            this._log("closing existing websocket");
+            this._log("Closing existing websocket");
             this._ws.close();
         }
         
@@ -46,30 +78,39 @@ class BitmexWebsocket {
                 .on("close", this.onClose)
                 .on("error", this.onError);
         
-        this._log("generated new websocket");
+        this._log("Generated new websocket");
     }
     
     private onOpen = () => {
-        this._log("connected to websocket");            
+        this._log("Connected to websocket");            
         this._connectChangedHandlers.forEach(h => h.trigger(Models.ConnectivityStatus.Connected));
     }
     
     private onMessage = (m: string) => {
-        const msg = JSON.parse(m);
-        if (_.has(msg, "table") && _.has(this._handlers, msg["table"])) {
-            this._handlers[msg["table"]](msg);
+        const t = moment.utc();
+        const msg : BitmexPublication<any> = JSON.parse(m);
+        
+        if (_.has(msg, "error")) {
+            Utils.errorLog(`Bitmex error: ${m}`);
+        }
+        else if (_.has(msg, "subscribe")) {
+            this._log(`Subscription response from Bitmex: ${m}`);
+        }
+        else if (_.has(msg, "table") && _.has(this._handlers, msg["table"])) {
+            const handler = this._handlers[msg["table"]];
+            handler(new Models.Timestamped(msg, t));
         }
     }
     
     private onClose = () => {
-        this._log("disconnected from websocket");
+        this._log("Disconnected from websocket");
         this._connectChangedHandlers.forEach(h => h.trigger(Models.ConnectivityStatus.Disconnected));
         
         setTimeout(this.regenerateWebsocket, moment.duration(5, "seconds").asMilliseconds());
     }
     
     private onError = (e) => {
-        Utils.errorLog("error from websocket", e);
+        Utils.errorLog("Error from websocket", e);
     }
     
     public subscribeToConnectChanged = (evt: Utils.Evt<Models.ConnectivityStatus>) => {
@@ -81,10 +122,12 @@ class BitmexWebsocket {
         this._connectChangedHandlers.push(evt);
     }
     
-    public subscribe = <T>(topic: string, handler: (msg: T) => void) => {
+    public subscribe = <T>(topic: string, handler: (msg: Models.Timestamped<BitmexPublication<T>>) => void) => {
         if (_.has(this._handlers, topic))
             throw new Error("Already registered a subscriber for topic " + handler);
         this._handlers[topic] = handler;
+        
+        this.send<BitmexWebsocketOp>({op: "subscribe", args: topic});
     }
     
     public send = <T>(msg: T) => {
@@ -97,7 +140,27 @@ class BitmexMarketDataGateway implements Interfaces.IMarketDataGateway {
     
     MarketData: Utils.Evt<Models.Market>;
     
+    private onMarketData = (msg: Models.Timestamped<BitmexPublication<BitmexOrderBookFull>>) => {
+        const bids = msg.data.data.bids.map(b => new Models.MarketSide(b[0], b[1]));
+        const asks = msg.data.data.asks.map(a => new Models.MarketSide(a[0], a[1]));
+        this.MarketData.trigger(new Models.Market(bids, asks, msg.time));
+    }
+    
     MarketTrade: Utils.Evt<Models.GatewayMarketTrade>;
+    
+    private onTrade = (msg: Models.Timestamped<BitmexPublication<BitmexMarketTrade>>) => { 
+        const t = msg.data.data;
+        const time = moment(t.timestamp);
+        const side = t.side === "Buy" ? Models.Side.Bid : Models.Side.Ask;
+        this.MarketTrade.trigger(new Models.GatewayMarketTrade(t.price, t.size, time, false, side));
+    }
+    
+    constructor(
+            private _future: Models.Future, 
+            private _socket: BitmexWebsocket) {
+        this._socket.subscribe(`orderBook10:${_future.symbol}`, this.onMarketData);
+        this._socket.subscribe(`trade:${_future.symbol}`, this.onTrade);
+    }
 }
 
 class BitmexOrderEntryGateway implements Interfaces.IOrderEntryGateway {

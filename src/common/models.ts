@@ -316,6 +316,14 @@ export class CurrencyPair {
     }
 }
 
+export class Future extends CurrencyPair {
+    constructor(
+        public base: Currency, 
+        public quote: Currency, 
+        public expiration: moment.Moment, 
+        public symbol: string) { super(base, quote) }
+}
+
 export function currencyPairEqual(a: CurrencyPair, b: CurrencyPair): boolean {
     return a.base === b.base && a.quote === b.quote;
 }
