@@ -31,7 +31,7 @@ interface BitmexPublication<T> {
     table: string,
     keys: string[],
     action: string,
-    data: T
+    data: T[]
 }
 
 interface BitmexOrderBookFull {
@@ -54,12 +54,15 @@ interface BitmexMarketTrade {
     foreignNotional: number
 }
 
+type BitmexHandler = (msg: Models.Timestamped<BitmexPublication<any>>) => void;
+
 class BitmexWebsocket {
     private _log = Utils.log("BitmexWebsocket");
     private _ws: ws = null;
     
     private _connectChangedHandlers : Utils.Evt<Models.ConnectivityStatus>[] = [];
-    private _handlers : {[topic: string] : (msg: Models.Timestamped<BitmexPublication<any>>) => void} = {};
+    private _handlers : {[topic: string] : BitmexHandler} = {};
+    private _subscriptions : BitmexWebsocketOp[] = [];
     
     constructor(private _config : Config.IConfigProvider) {
         this.regenerateWebsocket();
@@ -82,7 +85,8 @@ class BitmexWebsocket {
     }
     
     private onOpen = () => {
-        this._log("Connected to websocket");            
+        this._log(`Connected to websocket, sending ${this._subscriptions.length} subscriptions`);
+        this._subscriptions.forEach(s => this.send(s));      
         this._connectChangedHandlers.forEach(h => h.trigger(Models.ConnectivityStatus.Connected));
     }
     
@@ -100,6 +104,9 @@ class BitmexWebsocket {
             const handler = this._handlers[msg["table"]];
             handler(new Models.Timestamped(msg, t));
         }
+        else {
+            this._log(`Dropping unhandled message ${util.format(msg)}`);
+        }
     }
     
     private onClose = () => {
@@ -113,8 +120,12 @@ class BitmexWebsocket {
         Utils.errorLog("Error from websocket", e);
     }
     
+    private isConnected = () => {
+        return this._ws !== null && this._ws.readyState === ws.OPEN;
+    }
+    
     public subscribeToConnectChanged = (evt: Utils.Evt<Models.ConnectivityStatus>) => {
-        if (this._ws.readyState === ws.OPEN)
+        if (this.isConnected())
             evt.trigger(Models.ConnectivityStatus.Connected);
         else
             evt.trigger(Models.ConnectivityStatus.Disconnected);
@@ -122,12 +133,22 @@ class BitmexWebsocket {
         this._connectChangedHandlers.push(evt);
     }
     
-    public subscribe = <T>(topic: string, handler: (msg: Models.Timestamped<BitmexPublication<T>>) => void) => {
+    public subscribe = <T>(topic: string, handler: BitmexHandler, topicFilter?: string) => {
+        const sentTopic = topicFilter != null ? `${topic}:${topicFilter}` : topic;
+        
         if (_.has(this._handlers, topic))
             throw new Error("Already registered a subscriber for topic " + handler);
+        else
+            this._log(`Setting up subscription for ${topic}, sentTopic: ${sentTopic}`);
+            
         this._handlers[topic] = handler;
         
-        this.send<BitmexWebsocketOp>({op: "subscribe", args: topic});
+        const op = {op: "subscribe", args: sentTopic};
+        this._subscriptions.push(op);
+        
+        if (this.isConnected()) {
+            this.send<BitmexWebsocketOp>(op);
+        }
     }
     
     public send = <T>(msg: T) => {
@@ -136,28 +157,39 @@ class BitmexWebsocket {
 }
 
 class BitmexMarketDataGateway implements Interfaces.IMarketDataGateway {
+    private _log = Utils.log("BitmexMD");
+    
     ConnectChanged = new Utils.Evt<Models.ConnectivityStatus>();
     MarketData = new Utils.Evt<Models.Market>();
     MarketTrade = new Utils.Evt<Models.GatewayMarketTrade>();
     
+    private convertSide = (side: [number, number][]) => {
+        return _(side).map(b => new Models.MarketSide(b[0], b[1])).take(5).value();
+    };
+    
     private onMarketData = (msg: Models.Timestamped<BitmexPublication<BitmexOrderBookFull>>) => {
-        const bids = msg.data.data.bids.map(b => new Models.MarketSide(b[0], b[1]));
-        const asks = msg.data.data.asks.map(a => new Models.MarketSide(a[0], a[1]));
-        this.MarketData.trigger(new Models.Market(bids, asks, msg.time));
+        for (let md of msg.data.data) {
+            const bids = this.convertSide(md.bids);
+            const asks = this.convertSide(md.asks);
+            const market = new Models.Market(bids, asks, msg.time);
+            this.MarketData.trigger(market);
+        }
     }
     
     private onTrade = (msg: Models.Timestamped<BitmexPublication<BitmexMarketTrade>>) => { 
-        const t = msg.data.data;
-        const time = moment(t.timestamp);
-        const side = t.side === "Buy" ? Models.Side.Bid : Models.Side.Ask;
-        this.MarketTrade.trigger(new Models.GatewayMarketTrade(t.price, t.size, time, false, side));
+        for (let mt of msg.data.data) {
+            const time = moment(mt.timestamp);
+            const side = mt.side === "Buy" ? Models.Side.Ask : Models.Side.Bid; // Bitmex actually sends the take side
+            const trade = new Models.GatewayMarketTrade(mt.price, mt.size, time, false, side);
+            this.MarketTrade.trigger(trade);
+        }
     }
     
     constructor(
             private _future: Models.Future, 
             private _socket: BitmexWebsocket) {
-        this._socket.subscribe(`orderBook10:${_future.symbol}`, this.onMarketData);
-        this._socket.subscribe(`trade:${_future.symbol}`, this.onTrade);
+        this._socket.subscribe("orderBook10", this.onMarketData, _future.symbol);
+        this._socket.subscribe("trade", this.onTrade, _future.symbol);
         this._socket.subscribeToConnectChanged(this.ConnectChanged);
     }
 }
@@ -186,7 +218,7 @@ class BitmexOrderEntryGateway implements Interfaces.IOrderEntryGateway {
 }
 
 class BitmexPositionGateway implements Interfaces.IPositionGateway {
-    PositionUpdate: Utils.Evt<Models.CurrencyPosition>;
+    PositionUpdate = new Utils.Evt<Models.CurrencyPosition>();
 }
 
 class BitmexBaseGateway implements Interfaces.IExchangeDetailsGateway {
@@ -200,4 +232,23 @@ class BitmexBaseGateway implements Interfaces.IExchangeDetailsGateway {
     ];
 
     hasSelfTradePrevention: boolean = false;
+}
+
+const parseFuture = (pair: Models.CurrencyPair, config: Config.IConfigProvider) : Models.Future => {
+    const futureSymbol = config.GetString("BitmexFutureSymbol")
+    return new Models.Future(pair.base, pair.quote, null, futureSymbol);
+}
+
+export class Bitmex extends Interfaces.CombinedGateway {
+    constructor(timeProvider: Utils.ITimeProvider, config: Config.IConfigProvider, pair: Models.CurrencyPair) {
+        var socket = new BitmexWebsocket(config);
+        
+        const future = parseFuture(pair, config);
+        const md = new BitmexMarketDataGateway(future, socket);
+        const oe = new BitmexOrderEntryGateway();
+        const pg = new BitmexPositionGateway();
+        const ed = new BitmexBaseGateway();
+
+        super(md, oe, pg, ed);
+    }
 }
