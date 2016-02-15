@@ -193,10 +193,13 @@ class BitmexPositionGateway implements Interfaces.IPositionGateway {
 
 class BitmexBaseGateway implements Interfaces.IExchangeDetailsGateway {
     name(): string { return "Bitmex"; }
-    makeFee(): number { return 0; }
-    takeFee(): number { return 0; }
+    makeFee(): number { return -0.025/100; }
+    takeFee(): number { return 0.075/100; }
     exchange(): Models.Exchange { return Models.Exchange.Bitmex; }
-    supportedCurrencyPairs: Models.CurrencyPair[];
+    
+    supportedCurrencyPairs = [
+        new Models.CurrencyPair(Models.Currency.BTC, Models.Currency.USD)
+    ];
 
-    hasSelfTradePrevention: boolean;
+    hasSelfTradePrevention: boolean = false;
 }
