@@ -177,10 +177,12 @@ class BitmexMarketDataGateway implements Interfaces.IMarketDataGateway {
     }
     
     private onTrade = (msg: Models.Timestamped<BitmexPublication<BitmexMarketTrade>>) => { 
+        const onStartup = msg.data.action === "partial";
+        
         for (let mt of msg.data.data) {
             const time = moment(mt.timestamp);
             const side = mt.side === "Buy" ? Models.Side.Ask : Models.Side.Bid; // Bitmex actually sends the take side
-            const trade = new Models.GatewayMarketTrade(mt.price, mt.size, time, false, side);
+            const trade = new Models.GatewayMarketTrade(mt.price, mt.size, time, onStartup, side);
             this.MarketTrade.trigger(trade);
         }
     }
