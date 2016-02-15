@@ -137,16 +137,14 @@ class BitmexWebsocket {
 
 class BitmexMarketDataGateway implements Interfaces.IMarketDataGateway {
     ConnectChanged = new Utils.Evt<Models.ConnectivityStatus>();
-    
-    MarketData: Utils.Evt<Models.Market>;
+    MarketData = new Utils.Evt<Models.Market>();
+    MarketTrade = new Utils.Evt<Models.GatewayMarketTrade>();
     
     private onMarketData = (msg: Models.Timestamped<BitmexPublication<BitmexOrderBookFull>>) => {
         const bids = msg.data.data.bids.map(b => new Models.MarketSide(b[0], b[1]));
         const asks = msg.data.data.asks.map(a => new Models.MarketSide(a[0], a[1]));
         this.MarketData.trigger(new Models.Market(bids, asks, msg.time));
     }
-    
-    MarketTrade: Utils.Evt<Models.GatewayMarketTrade>;
     
     private onTrade = (msg: Models.Timestamped<BitmexPublication<BitmexMarketTrade>>) => { 
         const t = msg.data.data;
@@ -160,11 +158,13 @@ class BitmexMarketDataGateway implements Interfaces.IMarketDataGateway {
             private _socket: BitmexWebsocket) {
         this._socket.subscribe(`orderBook10:${_future.symbol}`, this.onMarketData);
         this._socket.subscribe(`trade:${_future.symbol}`, this.onTrade);
+        this._socket.subscribeToConnectChanged(this.ConnectChanged);
     }
 }
 
 class BitmexOrderEntryGateway implements Interfaces.IOrderEntryGateway {
     ConnectChanged = new Utils.Evt<Models.ConnectivityStatus>();
+    OrderUpdate = new Utils.Evt<Models.OrderStatusReport>();
     
     sendOrder(order: Models.BrokeredOrder): Models.OrderGatewayActionReport {
         return new Models.OrderGatewayActionReport(moment.utc());
@@ -177,8 +177,6 @@ class BitmexOrderEntryGateway implements Interfaces.IOrderEntryGateway {
     replaceOrder(replace: Models.BrokeredReplace): Models.OrderGatewayActionReport {
         return new Models.OrderGatewayActionReport(moment.utc());
     }
-    
-    OrderUpdate: Utils.Evt<Models.OrderStatusReport>;
     
     cancelsByClientOrderId: boolean;
     
