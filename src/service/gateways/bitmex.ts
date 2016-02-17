@@ -5,12 +5,13 @@
 ///<reference path="../config.ts"/>
 ///<reference path="../utils.ts"/>
 ///<reference path="../interfaces.ts"/>
+///<reference path="./bitmex-api.ts"/>
 
 import ws = require('ws');
 import Q = require("q");
 import crypto = require("crypto");
 import request = require("request");
-import url = require("url");
+import Url = require("url");
 import querystring = require("querystring");
 import Config = require("../config");
 import NullGateway = require("./nullgw");
@@ -20,6 +21,7 @@ import util = require("util");
 import Interfaces = require("../interfaces");
 import moment = require("moment");
 import _ = require("lodash");
+import Api = require("./bitmex-api");
 var shortId = require("shortid");
 
 interface BitmexWebsocketOp {
@@ -39,19 +41,6 @@ interface BitmexOrderBookFull {
     bids: [number, number][],
     asks: [number, number][],
     timestamp: string
-}
-
-interface BitmexMarketTrade {
-    timestamp: string,
-    symbol: string,
-    side: string,
-    size: number,
-    price: number,
-    tickDirection: string,
-    trdMatchID: string,
-    grossValue: number,
-    homeNotional: number,
-    foreignNotional: number
 }
 
 type BitmexHandler = (msg: Models.Timestamped<BitmexPublication<any>>) => void;
@@ -176,7 +165,7 @@ class BitmexMarketDataGateway implements Interfaces.IMarketDataGateway {
         }
     }
     
-    private onTrade = (msg: Models.Timestamped<BitmexPublication<BitmexMarketTrade>>) => { 
+    private onTrade = (msg: Models.Timestamped<BitmexPublication<Api.Trade>>) => { 
         const onStartup = msg.data.action === "partial";
         
         for (let mt of msg.data.data) {
@@ -197,30 +186,119 @@ class BitmexMarketDataGateway implements Interfaces.IMarketDataGateway {
 }
 
 class BitmexOrderEntryGateway implements Interfaces.IOrderEntryGateway {
+    private _log = Utils.log("BitmexOE");
+    
     ConnectChanged = new Utils.Evt<Models.ConnectivityStatus>();
     OrderUpdate = new Utils.Evt<Models.OrderStatusReport>();
     
+    private static convertTif(t : Models.TimeInForce) : string {
+        switch (t) {
+            case Models.TimeInForce.FOK: return "FillOrKill";
+            case Models.TimeInForce.GTC: return "GoodTillCancel";
+            case Models.TimeInForce.IOC: return "ImmediateOrCancel";
+            default: throw new Error("Unable to send TIF " + Models.TimeInForce[t]);
+        }
+    };
+    
+    private static convertOrderType(t : Models.OrderType) : string {
+        switch (t) {
+            case Models.OrderType.Limit: return "Limit";
+            case Models.OrderType.Market: return "Market";
+            default: throw new Error("Unable to send order type " + Models.OrderType[t]);
+        }
+    }
+    
     sendOrder(order: Models.BrokeredOrder): Models.OrderGatewayActionReport {
+        const tif = BitmexOrderEntryGateway.convertTif(order.timeInForce);
+        const type = BitmexOrderEntryGateway.convertOrderType(order.type);
+        const sent = this._orderApi.orderNewOrder(this._future.symbol, order.quantity, 
+            order.price, tif, type, undefined, order.orderId);
+            
+        sent.then(f => this.handleExecution(f.body))
+            .fail(err => this.handleErrorRejection(err, order.orderId, false));
+        
         return new Models.OrderGatewayActionReport(moment.utc());
     }
     
     cancelOrder(cancel: Models.BrokeredCancel): Models.OrderGatewayActionReport {
+        const sent = this._orderApi.orderCancelOrder(cancel.exchangeId, cancel.clientOrderId);
+        
+        sent.then(f => f.body.forEach(this.handleExecution))
+            .fail(err => this.handleErrorRejection(err, cancel.clientOrderId, true));
+        
         return new Models.OrderGatewayActionReport(moment.utc());
     }
     
     replaceOrder(replace: Models.BrokeredReplace): Models.OrderGatewayActionReport {
-        return new Models.OrderGatewayActionReport(moment.utc());
+        this.cancelOrder(new Models.BrokeredCancel(replace.origOrderId, replace.orderId, replace.side, replace.exchangeId));
+        return this.sendOrder(replace);
     }
     
-    cancelsByClientOrderId: boolean;
+    private handleExecution = (o: Api.Execution | Api.Order) => {
+        this._log("Handling BitMex execution report" + util.format(o));
+        
+        let status : Models.OrderStatus;
+        if (o.workingIndicator) {
+            status = Models.OrderStatus.Working;
+        }
+        else {
+            if (o.ordRejReason !== undefined) {
+                status = Models.OrderStatus.Rejected;
+            }
+            else {
+                status = Models.OrderStatus.Cancelled;
+            }
+        }
+        
+        const osr : Models.OrderStatusReport = {
+            averagePrice: o.avgPx,
+            cumQuantity: o.cumQty,
+            exchangeId: o.orderID,
+            leavesQuantity: o.leavesQty,
+            orderStatus: Models.OrderStatus.Cancelled,
+            price: o.price,
+            quantity: o.orderQty,
+            rejectMessage: o.ordRejReason,
+            orderId: o.clOrdID,
+        };
+        
+        if (typeof o["lastPx"] !== undefined) {
+            const exec = <Api.Execution>o;
+            osr.lastPrice = exec.lastPx;
+            osr.lastQuantity = exec.lastQty;
+            //osr.liquidity = exec.lastLiquidityInd ? "Make"
+        }
+        
+        this.OrderUpdate.trigger(osr);
+    }
     
-    generateClientOrderId(): string {
-        return shortId.generate();
+    private handleErrorRejection = (e : Error, id: string, cancelRejected: boolean) => {
+        const t = moment.utc();
+        this.OrderUpdate.trigger({
+            orderId: id,
+            orderStatus: Models.OrderStatus.Rejected,
+            time: t,
+            cancelRejected: cancelRejected,
+            rejectMessage: e.message
+        });
+    };
+    
+    cancelsByClientOrderId: boolean = true;
+    
+    generateClientOrderId = () => shortId.generate();
+    
+    private _orderApi : Api.OrderApi;
+    constructor(config : Config.IConfigProvider, private _future : Models.Future) {
+        this._orderApi = new Api.OrderApi(config.GetString("BitmexRestUrl"));
     }
 }
 
 class BitmexPositionGateway implements Interfaces.IPositionGateway {
     PositionUpdate = new Utils.Evt<Models.CurrencyPosition>();
+    
+    constructor() {
+        
+    }
 }
 
 class BitmexBaseGateway implements Interfaces.IExchangeDetailsGateway {
@@ -236,6 +314,28 @@ class BitmexBaseGateway implements Interfaces.IExchangeDetailsGateway {
     hasSelfTradePrevention: boolean = false;
 }
 
+class BitmexAuthenticator {
+    private _apiSecret : string;
+    private _nonce : number;
+    
+    constructor(config: Config.IConfigProvider) {
+        this._apiSecret = config.GetString("BitmexApiSecret");
+        this._nonce = new Date().valueOf();
+    }
+    
+    // https://github.com/BitMEX/market-maker/blob/master/test/websocket-apikey-auth-test.py
+    public generateSignature = (verb: string, url: string, postdict? : any) => {
+        this._nonce += 1;
+        
+        const data = postdict ? JSON.stringify(postdict) : "";
+        const url_parsed = Url.parse(url);
+        const path = url_parsed.query ? `${url_parsed.path}?${url_parsed.query}` : url_parsed.path;
+        const message = new Buffer(`${verb}${path}${this._nonce}${data}`, 'utf8');
+        
+        return crypto.createHmac('sha256', this._apiSecret).update(message).digest('hex');
+    }
+}
+
 const parseFuture = (pair: Models.CurrencyPair, config: Config.IConfigProvider) : Models.Future => {
     const futureSymbol = config.GetString("BitmexFutureSymbol")
     return new Models.Future(pair.base, pair.quote, null, futureSymbol);
@@ -247,10 +347,17 @@ export class Bitmex extends Interfaces.CombinedGateway {
         
         const future = parseFuture(pair, config);
         const md = new BitmexMarketDataGateway(future, socket);
-        const oe = new BitmexOrderEntryGateway();
+        const oe = new BitmexOrderEntryGateway(config, future);
         const pg = new BitmexPositionGateway();
         const ed = new BitmexBaseGateway();
 
         super(md, oe, pg, ed);
     }
+}
+
+if (require.main === module) { 
+    console.log("starting test");
+    process.env.BitmexApiSecret = "12345";
+    const auth = new BitmexAuthenticator(new Config.ConfigProvider());
+    console.log(auth.generateSignature("POST", "url", {"post": "dict"}))
 }
