@@ -47,10 +47,6 @@
   "scripts": {
     "test": "mocha"
   },
-  "repository": {
-    "type": "git",
-    "url": "git@bitbucket.org:michaelgrosner/tribeca.git"
-  },
   "author": "",
   "license": "ISC"
 }
